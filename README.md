@@ -17,6 +17,10 @@ This project demonstrates the power of modern AI technologies by combining:
 
 Perfect for researchers, students, content creators, or anyone who wants to transform written content into engaging audio format or have intelligent conversations with their documents.
 
+## 📽️ Watch the video
+
+[![Video](https://i.ibb.co/8nnJmnZM/notebook-lm.png)](https://youtu.be/ymgPvhN0xko)
+
 ## ✨ Key Features
 
 ### 💬 RAG Document Chat (Left Panel)
