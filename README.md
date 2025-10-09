@@ -283,96 +283,146 @@ This tells you:
 ## 🏗️ System Architecture
 
 ### Component Architecture
-```
-┌────────────────── Frontend (React + TypeScript) ──────────────────┐
-│  ┌──────────────┐              ┌──────────────┐                   │
-│  │ RAGPanel     │              │ PodcastPanel │                   │
-│  │ - Upload UI  │              │ - Generate   │                   │
-│  │ - Chat       │              │ - Player     │                   │
-│  └──────────────┘              └──────────────┘                   │
-└───────────────────────┬───────────────────────────────────────────┘
-                        │ Axios HTTP Requests
-┌───────────────────────▼─── Backend (FastAPI) ─────────────────────┐
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐                   │
-│  │ Documents  │  │ Chat       │  │ Podcast    │                   │
-│  │ API        │  │ API        │  │ API        │                   │
-│  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘                   │
-│        │               │               │                          │
-│  ┌─────▼──────┐  ┌─────▼──────┐  ┌─────▼──────┐                   │
-│  │ PDF        │  │ RAG        │  │ Podcast    │                   │
-│  │ Processor  │  │ Service    │  │ Service    │                   │
-│  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘                   │
-│        │               │               │                          │
-│  ┌─────▼──────────────┐│               │                          │
-│  │ VectorStore        ││               │                          │
-│  │ (FAISS + Metadata) ││               │                          │
-│  └────────────────────┘│               │                          │
-└────────────────────────┼───────────────┼──────────────────────────┘
-                         │               │
-              ┌──────────▼───────────────▼───────────┐
-              │  External AI Services                │
-              │  - Groq API (LLM)                    │
-              │  - Ollama (Local LLM)                │
-              │  - ElevenLabs (TTS)                  │
-              │  - gTTS (Fallback TTS)               │
-              └──────────────────────────────────────┘
+
+```mermaid
+   graph TB
+    subgraph Frontend[" Frontend(React+TypeScript) "]
+        RAGPanel["RAGPanel<br/>- Upload UI<br/>- Chat"]
+        PodcastPanel["PodcastPanel<br/>- Generate<br/>- Player"]
+    end
+
+    subgraph Backend["Backend (FastAPI)"]
+        subgraph APIs["API Layer"]
+            DocumentsAPI["Documents API"]
+            ChatAPI["Chat API"]
+            PodcastAPI["Podcast API"]
+        end
+        
+        subgraph Services["Service Layer"]
+            PDFProcessor["PDF Processor"]
+            RAGService["RAG Service"]
+            PodcastService["Podcast Service"]
+        end
+        
+        VectorStore["VectorStore<br/>(FAISS + Metadata)"]
+        
+        DocumentsAPI --> PDFProcessor
+        ChatAPI --> RAGService
+        PodcastAPI --> PodcastService
+        
+        PDFProcessor --> VectorStore
+        RAGService --> VectorStore
+        VectorStore --> PodcastService
+    end
+
+    subgraph External["External AI Services"]
+        GroqAPI["Groq API (LLM)"]
+        Ollama["Ollama (Local LLM)"]
+        ElevenLabs["ElevenLabs (TTS)"]
+        gTTS["gTTS (Fallback TTS)"]
+    end
+
+    RAGPanel -.->|Axios HTTP| DocumentsAPI
+    RAGPanel -.->|Requests| ChatAPI
+    PodcastPanel -.->|Axios HTTP| PodcastAPI
+    
+    RAGService --> External
+    PodcastService --> External
+
+    style Frontend fill:#e1f5ff
+    style Backend fill:#fff4e1
+    style External fill:#f0f0f0
 ```
 
 ### RAG Pipeline Flow
-```
-PDF Upload ──► PyMuPDF Parse ──► Fixed Chunking ──► Embeddings
-                                  (512/50 overlap)    (384-dim)
-                                                         │
-                                                         ▼
-                                                    FAISS Index
-                                                         │
-User Query ─────────────────────────────────────────────►│
-                                                         ▼
-                                              Similarity Search
-                                                         │
-                                                         ▼
-                                              Top-3 Chunks Retrieved
-                                                         │
-                                                         ▼
-                                        [Context + Query] ──► LLM
-                                                                │
-                                                                ▼
-User ◄───────────────────────────────────────────────────── AI Answer
+
+```mermaid
+graph TD
+    Upload["PDF Upload"] --> Parse["PyMuPDF Parse"]
+    Parse --> Chunk["Fixed Chunking<br/>(512/50 overlap)"]
+    Chunk --> Embed["Embeddings<br/>(384-dim)"]
+    Embed --> FAISS["FAISS Index"]
+    
+    Query["User Query"] --> FAISS
+    FAISS --> Search["Similarity Search"]
+    Search --> Retrieve["Top-3 Chunks Retrieved"]
+    Retrieve --> Context["[Context + Query]"]
+    Context --> LLM["LLM"]
+    LLM --> Answer["AI Answer"]
+    Answer --> User["User"]
+
+    style Upload fill:#e3f2fd
+    style Parse fill:#e3f2fd
+    style Chunk fill:#e3f2fd
+    style Embed fill:#e3f2fd
+    style FAISS fill:#fff9c4
+    style Query fill:#f3e5f5
+    style Search fill:#fff9c4
+    style Retrieve fill:#fff9c4
+    style Context fill:#e8f5e9
+    style LLM fill:#e8f5e9
+    style Answer fill:#fce4ec
+    style User fill:#fce4ec
 ```
 
 ### Podcast Generation Flow
-```
-Document ──► Chunks ──► LLM Dialogue ──► TTS ──► Audio ──► MP3
-             (FAISS)    Generation      (ElevenLabs)  Merge  Export
-                        (Natural)        or gTTS     (Pydub)
 
-Dialogue Prompt Emphasizes:
-- No page numbers or citations
-- Conversational language
-- Natural reactions
-- Storytelling approach
+```mermaid
+graph LR
+    Document["Document"] --> Chunks["Chunks<br/>(FAISS)"]
+    Chunks --> LLM["LLM Dialogue<br/>Generation<br/>(Natural)"]
+    LLM --> TTS["TTS<br/>(ElevenLabs<br/>or gTTS)"]
+    TTS --> Audio["Audio<br/>Merge<br/>(Pydub)"]
+    Audio --> MP3["MP3<br/>Export"]
+
+    Note1["Dialogue Prompt Emphasizes:<br/>• No page numbers or citations<br/>• Conversational language<br/>• Natural reactions<br/>• Storytelling approach<br/> ."]
+
+    Note1 ~~~ Document
+
+    style Document fill:#e3f2fd
+    style Chunks fill:#e3f2fd
+    style LLM fill:#e8f5e9
+    style TTS fill:#fff9c4
+    style Audio fill:#fce4ec
+    style MP3 fill:#fce4ec
+    style Note1 fill:#f5f5f5,stroke:#999,stroke-width:2px
 ```
 
 ## 📁 Project Structure
 
-```
-notebook-lm/
-├── backend/
-│   └── app/
-│       ├── api/routes/        # API endpoints
-│       ├── core/              # Configuration
-│       ├── models/            # Pydantic schemas
-│       ├── services/          # Business logic
-│       ├── uploads/           # Uploaded PDFs
-│       ├── vector_db/         # FAISS indices
-│       └── generated_audio/   # Podcast MP3s
-├── frontend/
-│   └── src/
-│       ├── components/        # React components
-│       └── App.tsx            # Main app
-├── .env                       # Environment variables
-├── LICENSE                    # MIT License
-└── README.md                  # Documentation
+```mermaid
+graph LR
+    Root["notebook-lm/"]
+    
+    Root --> Backend["backend/"]
+    Root --> Frontend["frontend/"]
+    Root --> Env[".env<br/>(Environment variables)"]
+    Root --> License["LICENSE<br/>(MIT License)"]
+    Root --> Readme["README.md<br/>(Documentation)"]
+    
+    Backend --> App["app/"]
+    
+    App --> API["api/routes/<br/>(API endpoints)"]
+    App --> Core["core/<br/>(Configuration)"]
+    App --> Models["models/<br/>(Pydantic schemas)"]
+    App --> Services["services/<br/>(Business logic)"]
+    App --> Uploads["uploads/<br/>(Uploaded PDFs)"]
+    App --> VectorDB["vector_db/<br/>(FAISS indices)"]
+    App --> Audio["generated_audio/<br/>(Podcast MP3s)"]
+    
+    Frontend --> Src["src/"]
+    
+    Src --> Components["components/<br/>(React components)"]
+    Src --> AppTsx["App.tsx<br/>(Main app)"]
+    
+    style Root fill:#e3f2fd,stroke:#1976d2,stroke-width:3px
+    style Backend fill:#fff9c4,stroke:#f57c00,stroke-width:2px
+    style Frontend fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    style App fill:#fff3e0
+    style Src fill:#f1f8e9
+    style Env fill:#fce4ec
+    style License fill:#fce4ec
+    style Readme fill:#fce4ec
 ```
 
 ## 🚀 Production Deployment & Future Scope
