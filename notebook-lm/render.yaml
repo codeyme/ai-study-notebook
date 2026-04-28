@@ -1,0 +1,48 @@
+# render.yaml  — Render Blueprint
+# Commit this to the root of your repository.
+# Render will detect it and let you deploy everything in one click.
+#
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  # ── Backend: FastAPI ────────────────────────────────────────────────────────
+  - type: web
+    name: doclens-backend
+    runtime: python
+    region: oregon
+    plan: free                          # upgrade to starter ($7/mo) for always-on
+    rootDir: notebook-lm                # folder that contains backend/ and pyproject.toml
+    buildCommand: pip install uv && uv sync
+    startCommand: cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /docs
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false                     # set in Render dashboard, never commit keys
+      - key: CORS_ORIGINS
+        value: https://doclens-frontend.onrender.com   # update after frontend deploy
+      - key: UPLOAD_DIR
+        value: /tmp/uploads
+      - key: VECTOR_DB_DIR
+        value: /tmp/vector_db
+      - key: AUDIO_OUTPUT_DIR
+        value: /tmp/generated_audio
+    # NOTE: /tmp is ephemeral on Render free tier.
+    # For persistence use a Render Disk (paid) or swap FAISS for a managed vector DB.
+
+  # ── Frontend: React static build ───────────────────────────────────────────
+  - type: web
+    name: doclens-frontend
+    runtime: static
+    region: oregon
+    plan: free
+    rootDir: notebook-lm/frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: build
+    envVars:
+      - key: REACT_APP_API_URL
+        value: https://doclens-backend.onrender.com
+    routes:
+      # SPA fallback — all routes serve index.html
+      - type: rewrite
+        source: /*
+        destination: /index.html
