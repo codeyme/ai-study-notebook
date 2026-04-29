@@ -1,15 +1,16 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
-from pathlib import Path
+import hashlib
 import shutil
+from pathlib import Path
 
-from app.models.schemas import DocumentUploadResponse
+from fastapi import APIRouter, UploadFile, File, HTTPException
+
 from app.core.config import settings
+from app.models.schemas import DocumentUploadResponse
 from app.services.pdf_processor import PDFProcessor
 from app.services.vector_store import VectorStore
 
 router = APIRouter()
 
-# Initialize services
 pdf_processor = PDFProcessor(
     chunk_size=settings.chunk_size,
     chunk_overlap=settings.chunk_overlap
@@ -21,25 +22,30 @@ vector_store = VectorStore(
 )
 
 
+def compute_document_id(file_path: Path) -> str:
+    """
+    Match the exact document_id logic used by PDFProcessor.process_pdf():
+    SHA-256 hash of file bytes, first 16 hex chars.
+    """
+    with open(file_path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
+
+
 @router.post("/upload", response_model=DocumentUploadResponse)
 async def upload_document(file: UploadFile = File(...)):
-    """Upload and process a PDF document"""
-
-    # Validate file type
-    if not file.filename.endswith('.pdf'):
+    if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    # Save uploaded file
-    file_path = settings.upload_dir / file.filename
+    upload_dir = Path(settings.upload_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    file_path = upload_dir / file.filename
 
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Process PDF
         document_id, chunks = pdf_processor.process_pdf(file_path)
-
-        # Add to vector store
         chunks_count = vector_store.add_document(document_id, chunks)
 
         return DocumentUploadResponse(
@@ -50,7 +56,6 @@ async def upload_document(file: UploadFile = File(...)):
         )
 
     except Exception as e:
-        # Clean up on error
         if file_path.exists():
             file_path.unlink()
         raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
@@ -58,6 +63,48 @@ async def upload_document(file: UploadFile = File(...)):
 
 @router.get("/documents/{document_id}/exists")
 async def check_document_exists(document_id: str):
-    """Check if a document exists in the vector store"""
     exists = vector_store.document_exists(document_id)
-    return {"exists": exists, "document_id": document_id}
+    return {
+        "exists": exists,
+        "document_id": document_id
+    }
+
+
+@router.get("/list")
+async def list_documents():
+    """
+    Return document IDs that match the vector store IDs.
+    This is what the analysis tabs need.
+    """
+    upload_dir = Path(settings.upload_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    documents = []
+
+    for pdf_file in upload_dir.glob("*.pdf"):
+        try:
+            document_id = compute_document_id(pdf_file)
+            indexed = vector_store.document_exists(document_id)
+
+            documents.append({
+                "id": document_id,
+                "filename": pdf_file.name,
+                "chunks": 0,
+                "uploaded_at": pdf_file.stat().st_mtime,
+                "indexed": indexed
+            })
+        except Exception as e:
+            documents.append({
+                "id": None,
+                "filename": pdf_file.name,
+                "chunks": 0,
+                "uploaded_at": pdf_file.stat().st_mtime,
+                "indexed": False,
+                "error": str(e)
+            })
+
+    documents.sort(key=lambda x: x["uploaded_at"], reverse=True)
+
+    return {
+        "documents": documents
+    }

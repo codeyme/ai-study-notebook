@@ -1,341 +1,435 @@
-"""
-analysis.py  –  NEW FILE
-Handles all the new intelligence features:
-  - /api/analysis/compare        – cross-document comparison
-  - /api/analysis/quiz           – quiz / flashcard generation
-  - /api/analysis/weak-topics    – topics that appear thin or shallow
-  - /api/analysis/concept-graph  – nodes + edges for concept map
-  - /api/analysis/gaps           – what is NOT covered in these docs
-"""
+import json
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
-import json, re
+
+from app.core.config import settings
+from app.services.vector_store import VectorStore
+from app.services.rag_service import RAGService
 
 router = APIRouter(prefix="/api/analysis", tags=["analysis"])
 
-# ── shared helpers ────────────────────────────────────────────────────────────
-
-def _get_llm_client():
-    """Return configured Groq or Ollama client (same pattern as existing code)."""
-    import os
-    groq_key = os.getenv("GROQ_API_KEY")
-    if groq_key:
-        from groq import Groq
-        return Groq(api_key=groq_key), "groq"
-    return None, "ollama"
-
-
-def _llm_chat(messages: list, max_tokens: int = 4096) -> str:
-    """Fire a chat completion; returns raw text."""
-    import os, httpx
-    client, provider = _get_llm_client()
-
-    if provider == "groq":
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            max_tokens=max_tokens,
-        )
-        return resp.choices[0].message.content
-
-    # Ollama fallback
-    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    model = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
-    payload = {"model": model, "messages": messages, "stream": False}
-    r = httpx.post(f"{ollama_url}/api/chat", json=payload, timeout=120)
-    r.raise_for_status()
-    return r.json()["message"]["content"]
-
-
-def _load_rag_service():
-    """Import the existing RAG service to reuse FAISS + text retrieval."""
-    from app.services.rag_service import RAGService
-    return RAGService()
-
-
-def _get_all_chunks(document_ids: List[str], rag) -> dict:
-    """
-    Returns { doc_id: [chunk_text, ...] } for each document.
-    Falls back gracefully if a doc doesn't exist.
-    """
-    result = {}
-    for doc_id in document_ids:
-        try:
-            # RAGService stores metadata; retrieve top-N broad chunks
-            chunks = rag.get_chunks_for_document(doc_id)
-            result[doc_id] = chunks
-        except Exception:
-            result[doc_id] = []
-    return result
-
-
-def _summarise_doc(doc_id: str, chunks: List[str], max_chars=8000) -> str:
-    text = " ".join(chunks)
-    return text[:max_chars]
-
-
-# ── request / response models ─────────────────────────────────────────────────
 
 class AnalysisRequest(BaseModel):
     document_ids: List[str]
-    focus: Optional[str] = None          # optional user hint
+    focus: Optional[str] = None
 
 
-class CompareResponse(BaseModel):
-    similarities: List[str]
-    differences: List[dict]              # [{topic, doc_a, doc_b}]
-    unique_to: dict                      # {doc_id: [topics]}
-    summary: str
+vector_store = VectorStore(
+    embedding_model=settings.embedding_model,
+    vector_db_dir=settings.vector_db_dir
+)
+
+rag_service = RAGService(
+    vector_store=vector_store,
+    groq_api_key=settings.groq_api_key,
+    ollama_base_url=settings.ollama_base_url,
+    ollama_model=settings.ollama_model
+)
 
 
-class QuizItem(BaseModel):
-    question: str
-    options: List[str]                   # 4 choices for MCQ, empty for flashcard
-    answer: str
-    explanation: str
-    doc_source: str
-    type: str                            # "mcq" | "flashcard"
+def get_doc_context(
+    document_id: str,
+    query: str = "summary key topics methods conclusions important concepts",
+    top_k: int = 6,
+    max_chars: int = 3000
+) -> str:
+    """
+    Pull a limited amount of text from the vector store so prompts stay small.
+    """
+    try:
+        results = vector_store.search(document_id, query, top_k)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error searching vector store for {document_id}: {str(e)}"
+        )
+
+    if not results:
+        return ""
+
+    context_parts = []
+    total_chars = 0
+
+    for item in results:
+        if isinstance(item, (list, tuple)) and len(item) >= 1:
+            chunk = str(item[0])
+        else:
+            chunk = str(item)
+
+        remaining = max_chars - total_chars
+        if remaining <= 0:
+            break
+
+        chunk = chunk[:remaining]
+        context_parts.append(chunk)
+        total_chars += len(chunk)
+
+    return "\n\n".join(context_parts)
 
 
-class QuizResponse(BaseModel):
-    items: List[QuizItem]
+def call_llm(prompt: str) -> str:
+    """
+    Use the existing RAG service's LLM client.
+    """
+    try:
+        if hasattr(rag_service, "llm") and rag_service.llm is not None:
+            response = rag_service.llm.invoke(prompt)
+            if hasattr(response, "content"):
+                return response.content
+            return str(response)
+
+        if hasattr(rag_service, "_query_ollama"):
+            return rag_service._query_ollama(prompt)
+
+        raise Exception("No usable LLM method found on RAGService")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM call failed: {str(e)}")
 
 
-class WeakTopicItem(BaseModel):
-    topic: str
-    reason: str
-    coverage_score: int                  # 1-10
-    doc_source: str
+def parse_json_response(text: str):
+    """
+    Robust JSON parsing for LLM output.
+    """
+    cleaned = text.strip()
+
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+
+    cleaned = cleaned.strip()
+
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = cleaned[start:end + 1]
+            try:
+                return json.loads(candidate)
+            except Exception:
+                pass
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Model did not return valid JSON. Raw response: {text}"
+        )
 
 
-class WeakTopicsResponse(BaseModel):
-    weak_topics: List[WeakTopicItem]
-    recommendation: str
-
-
-class ConceptNode(BaseModel):
-    id: str
-    label: str
-    group: str                           # doc_id or "shared"
-    weight: int                          # 1-5 importance
-
-
-class ConceptEdge(BaseModel):
-    source: str
-    target: str
-    label: str
-    weight: float
-
-
-class ConceptGraphResponse(BaseModel):
-    nodes: List[ConceptNode]
-    edges: List[ConceptEdge]
-
-
-class GapsResponse(BaseModel):
-    gaps: List[str]
-    related_but_shallow: List[str]
-    suggested_questions: List[str]
-
-
-# ── endpoints ─────────────────────────────────────────────────────────────────
-
-@router.post("/compare", response_model=CompareResponse)
-async def compare_documents(req: AnalysisRequest):
-    if len(req.document_ids) < 2:
-        raise HTTPException(400, "Provide at least 2 document_ids to compare.")
-
-    rag = _load_rag_service()
-    chunks_map = _get_all_chunks(req.document_ids, rag)
-
-    summaries = {
-        doc_id: _summarise_doc(doc_id, chunks)
-        for doc_id, chunks in chunks_map.items()
-    }
-
-    doc_labels = [f"Document-{i+1} (id:{did})" for i, did in enumerate(req.document_ids)]
-    summaries_text = "\n\n".join(
-        f"=== {doc_labels[i]} ===\n{summaries[did]}"
-        for i, did in enumerate(req.document_ids)
-    )
-
-    focus_hint = f"\nUser focus area: {req.focus}" if req.focus else ""
-    prompt = f"""You are an expert document analyst. Compare the following documents and respond ONLY with valid JSON.{focus_hint}
-
-{summaries_text}
-
-Return JSON with this exact shape:
-{{
-  "similarities": ["<shared theme 1>", ...],
-  "differences": [{{"topic": "...", "doc_a": "...", "doc_b": "..."}}],
-  "unique_to": {{"<doc_id>": ["<topic>", ...]}},
-  "summary": "<2-3 sentence overall comparison>"
-}}
-Replace doc_id keys with the actual document IDs provided."""
-
-    raw = _llm_chat([{"role": "user", "content": prompt}])
-    data = _parse_json(raw)
-    return CompareResponse(**data)
-
-
-@router.post("/quiz", response_model=QuizResponse)
+@router.post("/quiz")
 async def generate_quiz(req: AnalysisRequest):
-    rag = _load_rag_service()
-    chunks_map = _get_all_chunks(req.document_ids, rag)
+    if not req.document_ids:
+        raise HTTPException(status_code=400, detail="Select at least one document.")
 
-    all_text = ""
-    for doc_id, chunks in chunks_map.items():
-        all_text += f"\n--- Document {doc_id} ---\n" + " ".join(chunks[:30])
+    contexts = []
+    for doc_id in req.document_ids:
+        context = get_doc_context(
+            document_id=doc_id,
+            query=req.focus or "summary key topics methods conclusions important concepts",
+            top_k=5,
+            max_chars=2200
+        )
+        if context:
+            contexts.append(f"DOCUMENT {doc_id}:\n{context}")
 
-    all_text = all_text[:12000]
-    focus_hint = f"\nFocus on: {req.focus}" if req.focus else ""
+    if not contexts:
+        raise HTTPException(
+            status_code=404,
+            detail="No indexed document content found for the selected document(s)."
+        )
 
-    prompt = f"""You are a quiz master. Create 10 items (6 MCQ + 4 flashcards) from the documents below.{focus_hint}
-Respond ONLY with valid JSON.
+    prompt = f"""
+You are generating a study quiz from documents.
 
-DOCUMENTS:
-{all_text}
+Return valid JSON only.
 
-Return JSON:
+Required JSON shape:
 {{
   "items": [
     {{
-      "question": "...",
-      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+      "question": "string",
+      "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
       "answer": "A",
-      "explanation": "...",
-      "doc_source": "<document_id>",
+      "explanation": "string",
+      "doc_source": "document id",
       "type": "mcq"
     }},
     {{
-      "question": "...",
+      "question": "string",
       "options": [],
-      "answer": "...",
-      "explanation": "...",
-      "doc_source": "<document_id>",
+      "answer": "string",
+      "explanation": "string",
+      "doc_source": "document id",
       "type": "flashcard"
     }}
   ]
-}}"""
+}}
 
-    raw = _llm_chat([{"role": "user", "content": prompt}], max_tokens=3000)
-    data = _parse_json(raw)
-    items = [QuizItem(**item) for item in data.get("items", [])]
-    return QuizResponse(items=items)
+Rules:
+- Return exactly 6 items total
+- 4 items must be type "mcq"
+- 2 items must be type "flashcard"
+- Use only the selected documents
+- Focus area: {req.focus or "general understanding"}
+- Make the quiz useful and specific to the material
+- For MCQ, answer must be only one of: A, B, C, D
+- Keep explanations concise
+- Do not include markdown fences
+- Do not include commentary before or after JSON
+
+Context:
+{chr(10).join(contexts)}
+"""
+    result_text = call_llm(prompt)
+    return parse_json_response(result_text)
 
 
-@router.post("/weak-topics", response_model=WeakTopicsResponse)
-async def find_weak_topics(req: AnalysisRequest):
-    rag = _load_rag_service()
-    chunks_map = _get_all_chunks(req.document_ids, rag)
+@router.post("/compare")
+async def compare_documents(req: AnalysisRequest):
+    if len(req.document_ids) < 2:
+        raise HTTPException(status_code=400, detail="Select at least 2 documents.")
 
-    combined = ""
-    for doc_id, chunks in chunks_map.items():
-        combined += f"\n--- {doc_id} ---\n" + " ".join(chunks)
-    combined = combined[:10000]
+    selected_ids = req.document_ids[:2]
+    contexts = []
 
-    prompt = f"""Identify topics that are mentioned but covered only superficially (weak coverage) in these documents.
-Respond ONLY with valid JSON.
+    for doc_id in selected_ids:
+        context = get_doc_context(
+            document_id=doc_id,
+            query=req.focus or "summary key topics methods conclusions contributions limitations",
+            top_k=4,
+            max_chars=2200
+        )
 
-DOCUMENTS:
-{combined}
+        if context:
+            context = context[:2200]
+            contexts.append(f"DOCUMENT {doc_id}:\n{context}")
 
-Return JSON:
+    if len(contexts) < 2:
+        raise HTTPException(
+            status_code=404,
+            detail="Could not load enough indexed content for comparison."
+        )
+
+    prompt = f"""
+Compare the two documents below.
+
+Return valid JSON only.
+
+Required JSON shape:
+{{
+  "summary": "string",
+  "similarities": ["string", "string"],
+  "differences": [
+    {{
+      "topic": "string",
+      "doc_a": "string",
+      "doc_b": "string"
+    }}
+  ],
+  "unique_to": {{
+    "{selected_ids[0]}": ["string", "string"],
+    "{selected_ids[1]}": ["string", "string"]
+  }}
+}}
+
+Rules:
+- Compare the two documents meaningfully
+- Focus area: {req.focus or "general comparison"}
+- Be specific, not generic
+- Keep output concise
+- Limit similarities to 4 items
+- Limit differences to 5 items
+- Limit unique_to to 4 items per document
+- Do not include markdown fences
+- Do not include commentary before or after JSON
+
+Context:
+{chr(10).join(contexts)}
+"""
+    result_text = call_llm(prompt)
+    return parse_json_response(result_text)
+
+
+@router.post("/weak-topics")
+async def weak_topics(req: AnalysisRequest):
+    if not req.document_ids:
+        raise HTTPException(status_code=400, detail="Select at least one document.")
+
+    contexts = []
+    for doc_id in req.document_ids:
+        context = get_doc_context(
+            document_id=doc_id,
+            query=req.focus or "weak topics unclear areas shallow explanation limitations open questions",
+            top_k=5,
+            max_chars=2200
+        )
+        if context:
+            contexts.append(f"DOCUMENT {doc_id}:\n{context}")
+
+    if not contexts:
+        raise HTTPException(
+            status_code=404,
+            detail="No indexed document content found for the selected document(s)."
+        )
+
+    prompt = f"""
+Analyze the documents and identify weakly covered topics, unclear areas, shallow explanation areas, or places where a learner may still struggle.
+
+Return valid JSON only.
+
+Required JSON shape:
 {{
   "weak_topics": [
     {{
-      "topic": "...",
-      "reason": "why coverage is weak",
-      "coverage_score": 3,
-      "doc_source": "<doc_id>"
+      "topic": "string",
+      "reason": "string",
+      "coverage_score": 0,
+      "doc_source": "document id"
     }}
   ],
-  "recommendation": "overall learning recommendation"
+  "recommendation": "string"
 }}
-coverage_score is 1 (almost nothing) to 10 (thorough). Focus on scores 1-5."""
 
-    raw = _llm_chat([{"role": "user", "content": prompt}])
-    data = _parse_json(raw)
-    return WeakTopicsResponse(**data)
+Rules:
+- coverage_score must be an integer from 0 to 10
+- Lower score = weaker coverage
+- Focus area: {req.focus or "overall coverage"}
+- Keep the list concise
+- Do not include markdown fences
+- Do not include commentary before or after JSON
+
+Context:
+{chr(10).join(contexts)}
+"""
+    result_text = call_llm(prompt)
+    return parse_json_response(result_text)
 
 
-@router.post("/concept-graph", response_model=ConceptGraphResponse)
-async def build_concept_graph(req: AnalysisRequest):
-    rag = _load_rag_service()
-    chunks_map = _get_all_chunks(req.document_ids, rag)
+@router.post("/concept-graph")
+async def concept_graph(req: AnalysisRequest):
+    if not req.document_ids:
+        raise HTTPException(status_code=400, detail="Select at least one document.")
 
-    combined = ""
-    for doc_id, chunks in chunks_map.items():
-        combined += f"\n--- {doc_id} ---\n" + " ".join(chunks[:20])
-    combined = combined[:8000]
+    contexts = []
+    for doc_id in req.document_ids:
+        context = get_doc_context(
+            document_id=doc_id,
+            query=req.focus or "important concepts entities relationships methods results",
+            top_k=5,
+            max_chars=2000
+        )
+        if context:
+            contexts.append(f"DOCUMENT {doc_id}:\n{context}")
 
-    prompt = f"""Extract key concepts and their relationships from these documents to build a concept graph.
-Respond ONLY with valid JSON.
+    if not contexts:
+        raise HTTPException(
+            status_code=404,
+            detail="No indexed document content found for the selected document(s)."
+        )
 
-DOCUMENTS:
-{combined}
+    prompt = f"""
+Extract a concept graph from the document content.
 
-Return JSON:
+Return valid JSON only.
+
+Required JSON shape:
 {{
   "nodes": [
-    {{"id": "node_1", "label": "Machine Learning", "group": "<doc_id or 'shared'>", "weight": 5}}
+    {{
+      "id": "string",
+      "label": "string",
+      "group": "string",
+      "weight": 1
+    }}
   ],
   "edges": [
-    {{"source": "node_1", "target": "node_2", "label": "enables", "weight": 0.8}}
+    {{
+      "source": "string",
+      "target": "string",
+      "label": "relates_to",
+      "weight": 0.8
+    }}
   ]
 }}
-Include 15-25 nodes and 20-35 edges. Weight nodes 1-5 by importance. Edge weight 0-1."""
 
-    raw = _llm_chat([{"role": "user", "content": prompt}])
-    data = _parse_json(raw)
-    return ConceptGraphResponse(**data)
+Rules:
+- Keep node ids simple and unique
+- Return 5 to 15 nodes if possible
+- Return meaningful relations
+- Focus area: {req.focus or "key concepts"}
+- Do not include markdown fences
+- Do not include commentary before or after JSON
+
+Context:
+{chr(10).join(contexts)}
+"""
+    result_text = call_llm(prompt)
+    return parse_json_response(result_text)
 
 
-@router.post("/gaps", response_model=GapsResponse)
-async def find_coverage_gaps(req: AnalysisRequest):
-    rag = _load_rag_service()
-    chunks_map = _get_all_chunks(req.document_ids, rag)
+@router.post("/gaps")
+async def gaps(req: AnalysisRequest):
+    if not req.document_ids:
+        raise HTTPException(status_code=400, detail="Select at least one document.")
 
-    combined = ""
-    for doc_id, chunks in chunks_map.items():
-        combined += f"\n--- {doc_id} ---\n" + " ".join(chunks)
-    combined = combined[:10000]
-    focus_hint = f"\nDomain/focus: {req.focus}" if req.focus else ""
+    contexts = []
+    for doc_id in req.document_ids:
+        context = get_doc_context(
+            document_id=doc_id,
+            query=req.focus or "missing topics shallow areas gaps limitations unanswered questions",
+            top_k=5,
+            max_chars=2200
+        )
+        if context:
+            contexts.append(f"DOCUMENT {doc_id}:\n{context}")
 
-    prompt = f"""Analyse what is NOT covered or barely mentioned in these documents.{focus_hint}
-Respond ONLY with valid JSON.
+    if not contexts:
+        raise HTTPException(
+            status_code=404,
+            detail="No indexed document content found for the selected document(s)."
+        )
 
-DOCUMENTS:
-{combined}
+    prompt = f"""
+Analyse what is NOT covered or is only barely covered in these documents.
 
-Return JSON:
+Return valid JSON only.
+
+Required JSON shape:
 {{
-  "gaps": ["topic completely absent 1", "topic completely absent 2", ...],
-  "related_but_shallow": ["topic mentioned but needs more depth", ...],
-  "suggested_questions": ["Question you cannot answer from these docs 1", ...]
+  "gaps": [
+    "topic completely absent 1",
+    "topic completely absent 2"
+  ],
+  "related_but_shallow": [
+    "topic mentioned but needs more depth"
+  ],
+  "suggested_questions": [
+    "Question you cannot answer from these docs 1",
+    "Question you cannot answer from these docs 2"
+  ]
 }}
-gaps: 5-8 items. related_but_shallow: 3-5 items. suggested_questions: 5 items."""
 
-    raw = _llm_chat([{"role": "user", "content": prompt}])
-    data = _parse_json(raw)
-    return GapsResponse(**data)
+Rules:
+- gaps: 5 to 8 short strings
+- related_but_shallow: 3 to 5 short strings
+- suggested_questions: exactly 5 strings
+- every array item must be plain text
+- no objects
+- no severity scores
+- no recommendations field
+- Focus area: {req.focus or "knowledge gaps"}
+- Keep the output concise
+- Do not include markdown fences
+- Do not include commentary before or after JSON
 
-
-# ── util ──────────────────────────────────────────────────────────────────────
-
-def _parse_json(text: str) -> dict:
-    """Extract and parse JSON from LLM output, stripping markdown fences."""
-    text = re.sub(r"```json\s*", "", text)
-    text = re.sub(r"```\s*", "", text)
-    # find first { or [
-    start = min(
-        (text.find("{") if text.find("{") != -1 else len(text)),
-        (text.find("[") if text.find("[") != -1 else len(text)),
-    )
-    text = text[start:]
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        raise HTTPException(500, f"LLM returned invalid JSON: {e}\nRaw: {text[:300]}")
+Context:
+{chr(10).join(contexts)}
+"""
+    result_text = call_llm(prompt)
+    return parse_json_response(result_text)
